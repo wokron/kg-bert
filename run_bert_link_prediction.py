@@ -26,20 +26,19 @@ import sys
 
 import numpy as np
 import torch
+from flair.data import Sentence
+from flair.embeddings import StackedEmbeddings, CharacterEmbeddings, WordEmbeddings
+from sklearn import metrics
+from torch import Tensor, nn
+from torch.nn import CrossEntropyLoss
 from torch.utils.data import (DataLoader, RandomSampler, SequentialSampler,
                               TensorDataset)
 from torch.utils.data.distributed import DistributedSampler
 from tqdm import tqdm, trange
-
-from torch.nn import CrossEntropyLoss, MSELoss
-from scipy.stats import pearsonr, spearmanr
-from sklearn.metrics import matthews_corrcoef, f1_score
-from sklearn import metrics
-
-from pytorch_pretrained_bert.file_utils import PYTORCH_PRETRAINED_BERT_CACHE, WEIGHTS_NAME, CONFIG_NAME
-from pytorch_pretrained_bert.modeling import BertForSequenceClassification, BertConfig
-from pytorch_pretrained_bert.tokenization import BertTokenizer
-from pytorch_pretrained_bert.optimization import BertAdam, WarmupLinearSchedule
+from transformers import BertForSequenceClassification
+from transformers import BertTokenizer, get_linear_schedule_with_warmup
+from transformers.file_utils import PYTORCH_PRETRAINED_BERT_CACHE, WEIGHTS_NAME, CONFIG_NAME
+from transformers.optimization import AdamW
 
 os.environ['CUDA_VISIBLE_DEVICES']= '1'
 #torch.backends.cudnn.deterministic = True
@@ -74,11 +73,12 @@ class InputExample(object):
 class InputFeatures(object):
     """A single set of features of data."""
 
-    def __init__(self, input_ids, input_mask, segment_ids, label_id):
+    def __init__(self, input_ids, input_mask, segment_ids, label_id, input_embeddings):
         self.input_ids = input_ids
         self.input_mask = input_mask
         self.segment_ids = segment_ids
         self.label_id = label_id
+        self.input_embeddings = input_embeddings
 
 
 class DataProcessor(object):
@@ -113,7 +113,7 @@ class KGProcessor(DataProcessor):
     """Processor for knowledge graph data set."""
     def __init__(self):
         self.labels = set()
-    
+
     def get_train_examples(self, data_dir):
         """See base class."""
         return self._create_examples(
@@ -176,14 +176,14 @@ class KGProcessor(DataProcessor):
                 if len(temp) == 2:
                     end = temp[1]#.find(',')
                     ent2text[temp[0]] = temp[1]#[:end]
-  
+
         if data_dir.find("FB15") != -1:
             with open(os.path.join(data_dir, "entity2textlong.txt"), 'r') as f:
                 ent_lines = f.readlines()
                 for line in ent_lines:
                     temp = line.strip().split('\t')
                     #first_sent_end_position = temp[1].find(".")
-                    ent2text[temp[0]] = temp[1]#[:first_sent_end_position + 1] 
+                    ent2text[temp[0]] = temp[1]#[:first_sent_end_position + 1]
 
         entities = list(ent2text.keys())
 
@@ -192,12 +192,12 @@ class KGProcessor(DataProcessor):
             rel_lines = f.readlines()
             for line in rel_lines:
                 temp = line.strip().split('\t')
-                rel2text[temp[0]] = temp[1]      
+                rel2text[temp[0]] = temp[1]
 
         lines_str_set = set(['\t'.join(line) for line in lines])
         examples = []
         for (i, line) in enumerate(lines):
-            
+
             head_ent_text = ent2text[line[0]]
             tail_ent_text = ent2text[line[2]]
             relation_text = rel2text[line[1]]
@@ -209,16 +209,16 @@ class KGProcessor(DataProcessor):
                 guid = "%s-%s" % (set_type, i)
                 text_a = head_ent_text
                 text_b = relation_text
-                text_c = tail_ent_text 
+                text_c = tail_ent_text
                 self.labels.add(label)
                 examples.append(
                     InputExample(guid=guid, text_a=text_a, text_b=text_b, text_c = text_c, label=label))
-                
+
             elif set_type == "train":
                 guid = "%s-%s" % (set_type, i)
                 text_a = head_ent_text
                 text_b = relation_text
-                text_c = tail_ent_text 
+                text_c = tail_ent_text
                 examples.append(
                     InputExample(guid=guid, text_a=text_a, text_b=text_b, text_c = text_c, label="1"))
 
@@ -235,10 +235,10 @@ class KGProcessor(DataProcessor):
                             tmp_head = random.choice(tmp_ent_list)
                             tmp_triple_str = tmp_head + '\t' + line[1] + '\t' + line[2]
                             if tmp_triple_str not in lines_str_set:
-                                break                    
+                                break
                         tmp_head_text = ent2text[tmp_head]
                         examples.append(
-                            InputExample(guid=guid, text_a=tmp_head_text, text_b=text_b, text_c = text_c, label="0"))       
+                            InputExample(guid=guid, text_a=tmp_head_text, text_b=text_b, text_c = text_c, label="0"))
                 else:
                     # corrupting tail
                     tmp_tail = ''
@@ -253,10 +253,10 @@ class KGProcessor(DataProcessor):
                                 break
                         tmp_tail_text = ent2text[tmp_tail]
                         examples.append(
-                            InputExample(guid=guid, text_a=text_a, text_b=text_b, text_c = tmp_tail_text, label="0"))                                                  
+                            InputExample(guid=guid, text_a=text_a, text_b=text_b, text_c = tmp_tail_text, label="0"))
         return examples
 
-def convert_examples_to_features(examples, label_list, max_seq_length, tokenizer, print_info = True):
+def convert_examples_to_features(examples, label_list, max_seq_length, tokenizer, embeddings: StackedEmbeddings , embeddings_selection: Tensor, print_info = True):
     """Loads a data file into a list of `InputBatch`s."""
 
     label_map = {label : i for i, label in enumerate(label_list)}
@@ -313,9 +313,15 @@ def convert_examples_to_features(examples, label_list, max_seq_length, tokenizer
             segment_ids += [1] * (len(tokens_b) + 1)
         if tokens_c:
             tokens += tokens_c + ["[SEP]"]
-            segment_ids += [0] * (len(tokens_c) + 1)        
+            segment_ids += [0] * (len(tokens_c) + 1)
 
         input_ids = tokenizer.convert_tokens_to_ids(tokens)
+        input_sentence = Sentence(tokens)
+        embeddings.embed(input_sentence)
+        raw_embeddings = [t.embedding for t in input_sentence]
+        embeddings_size = [emb.embedding_length for emb in embeddings.embeddings]
+        embeddings_mask = torch.cat([torch.ones(embeddings_size[i], device=embeddings_selection.device) * embeddings_selection[i] for i in range(len(embeddings_size))], -1)
+        selected_embeddings = [raw * embeddings_mask for raw in raw_embeddings]
 
         # The mask has 1 for real tokens and 0 for padding tokens. Only real
         # tokens are attended to.
@@ -324,12 +330,14 @@ def convert_examples_to_features(examples, label_list, max_seq_length, tokenizer
         # Zero-pad up to the sequence length.
         padding = [0] * (max_seq_length - len(input_ids))
         input_ids += padding
+        selected_embeddings += [torch.zeros(embeddings.embedding_length, device=embeddings_selection.device)] * (max_seq_length - len(selected_embeddings))
         input_mask += padding
         segment_ids += padding
 
         assert len(input_ids) == max_seq_length
         assert len(input_mask) == max_seq_length
         assert len(segment_ids) == max_seq_length
+        assert len(selected_embeddings) == max_seq_length
 
         label_id = label_map[example.label]
 
@@ -348,7 +356,9 @@ def convert_examples_to_features(examples, label_list, max_seq_length, tokenizer
                 InputFeatures(input_ids=input_ids,
                               input_mask=input_mask,
                               segment_ids=segment_ids,
-                              label_id=label_id))
+                              label_id=label_id,
+                              input_embeddings=selected_embeddings,
+                              ))
     return features
 
 
@@ -569,9 +579,39 @@ def main():
 
     # Prepare model
     cache_dir = args.cache_dir if args.cache_dir else os.path.join(str(PYTORCH_PRETRAINED_BERT_CACHE), 'distributed_{}'.format(args.local_rank))
-    model = BertForSequenceClassification.from_pretrained(args.bert_model,
-              cache_dir=cache_dir,
-              num_labels=num_labels)
+
+    class BertAdapter(nn.Module):
+        def __init__(self, embedding_size, pretrained_model_name_or_path, cache_dir, num_labels):
+            super().__init__()
+            self.bert_model = BertForSequenceClassification.from_pretrained(
+                pretrained_model_name_or_path,
+                cache_dir=cache_dir,
+                num_labels=num_labels
+            )
+            self.adapter = nn.Linear(embedding_size, 768)
+
+        def forward(self, input_embeddings, segment_ids, input_mask, labels=None):
+            adapted_embeddings = self.adapter(input_embeddings)
+
+            return self.bert_model(
+                inputs_embeds=adapted_embeddings,
+                token_type_ids=segment_ids,
+                attention_mask=input_mask,
+                labels=labels,
+            )
+
+    embeddings = StackedEmbeddings([
+        WordEmbeddings('glove'),
+        # CharacterEmbeddings(),
+    ])
+
+    model = BertAdapter(
+        embedding_size=embeddings.embedding_length,
+        pretrained_model_name_or_path=args.bert_model,
+        cache_dir=cache_dir,
+        num_labels=num_labels
+    )
+
     if args.fp16:
         model.half()
     model.to(device)
@@ -607,14 +647,16 @@ def main():
             optimizer = FP16_Optimizer(optimizer, dynamic_loss_scale=True)
         else:
             optimizer = FP16_Optimizer(optimizer, static_loss_scale=args.loss_scale)
-        warmup_linear = WarmupLinearSchedule(warmup=args.warmup_proportion,
-                                             t_total=num_train_optimization_steps)        
+        warmup_linear = get_linear_schedule_with_warmup(warmup=args.warmup_proportion,
+                                             num_training_steps=num_train_optimization_steps)
 
     else:
-        optimizer = BertAdam(optimizer_grouped_parameters,
-                             lr=args.learning_rate,
-                             warmup=args.warmup_proportion,
-                             t_total=num_train_optimization_steps)
+        num_warmup_steps = int(args.warmup_proportion * num_train_optimization_steps)
+        optimizer = AdamW(optimizer_grouped_parameters, lr=args.learning_rate, correct_bias=False,)
+        scheduler = get_linear_schedule_with_warmup(
+            optimizer, num_warmup_steps=num_warmup_steps,
+            num_training_steps=num_train_optimization_steps
+        )
 
     global_step = 0
     nb_tr_steps = 0
@@ -622,18 +664,19 @@ def main():
     if args.do_train:
 
         train_features = convert_examples_to_features(
-            train_examples, label_list, args.max_seq_length, tokenizer)
+            train_examples, label_list, args.max_seq_length, tokenizer, embeddings, torch.tensor([1, 0]).to(device))
         logger.info("***** Running training *****")
         logger.info("  Num examples = %d", len(train_examples))
         logger.info("  Batch size = %d", args.train_batch_size)
         logger.info("  Num steps = %d", num_train_optimization_steps)
         all_input_ids = torch.tensor([f.input_ids for f in train_features], dtype=torch.long)
+        all_input_embeddings = torch.stack([torch.stack(f.input_embeddings, dim=0) for f in train_features], dim=0)
         all_input_mask = torch.tensor([f.input_mask for f in train_features], dtype=torch.long)
         all_segment_ids = torch.tensor([f.segment_ids for f in train_features], dtype=torch.long)
 
         all_label_ids = torch.tensor([f.label_id for f in train_features], dtype=torch.long)
 
-        train_data = TensorDataset(all_input_ids, all_input_mask, all_segment_ids, all_label_ids)
+        train_data = TensorDataset(all_input_ids, all_input_embeddings, all_input_mask, all_segment_ids, all_label_ids)
         if args.local_rank == -1:
             train_sampler = RandomSampler(train_data)
         else:
@@ -647,10 +690,10 @@ def main():
             nb_tr_examples, nb_tr_steps = 0, 0
             for step, batch in enumerate(tqdm(train_dataloader, desc="Iteration")):
                 batch = tuple(t.to(device) for t in batch)
-                input_ids, input_mask, segment_ids, label_ids = batch
+                input_ids, input_embeddings, input_mask, segment_ids, label_ids = batch
 
                 # define a new function to compute loss values for both output_modes
-                logits = model(input_ids, segment_ids, input_mask, labels=None)
+                logits = model(input_embeddings, segment_ids, input_mask, labels=None).logits
                 #print(logits, logits.shape)
 
                 loss_fct = CrossEntropyLoss()
@@ -678,6 +721,7 @@ def main():
                         for param_group in optimizer.param_groups:
                             param_group['lr'] = lr_this_step
                     optimizer.step()
+                    scheduler.step()
                     optimizer.zero_grad()
                     global_step += 1
             print("Training loss: ", tr_loss, nb_tr_examples)
@@ -702,7 +746,7 @@ def main():
     model.to(device)
 
     if args.do_eval and (args.local_rank == -1 or torch.distributed.get_rank() == 0):
-        
+
         eval_examples = processor.get_dev_examples(args.data_dir)
         eval_features = convert_examples_to_features(
             eval_examples, label_list, args.max_seq_length, tokenizer)
@@ -719,7 +763,7 @@ def main():
         # Run prediction for full data
         eval_sampler = SequentialSampler(eval_data)
         eval_dataloader = DataLoader(eval_data, sampler=eval_sampler, batch_size=args.eval_batch_size)
-        
+
         # Load a trained model and vocabulary that you have fine-tuned
         model = BertForSequenceClassification.from_pretrained(args.output_dir, num_labels=num_labels)
         tokenizer = BertTokenizer.from_pretrained(args.output_dir, do_lower_case=args.do_lower_case)
@@ -743,7 +787,7 @@ def main():
             loss_fct = CrossEntropyLoss()
             tmp_eval_loss = loss_fct(logits.view(-1, num_labels), label_ids.view(-1))
             print(label_ids.view(-1))
-            
+
             eval_loss += tmp_eval_loss.mean().item()
             nb_eval_steps += 1
             if len(preds) == 0:
@@ -818,7 +862,7 @@ def main():
 
             loss_fct = CrossEntropyLoss()
             tmp_eval_loss = loss_fct(logits.view(-1, num_labels), label_ids.view(-1))
-            
+
             eval_loss += tmp_eval_loss.mean().item()
             nb_eval_steps += 1
             if len(preds) == 0:
@@ -830,7 +874,7 @@ def main():
         eval_loss = eval_loss / nb_eval_steps
         preds = preds[0]
         print(preds, preds.shape)
-        
+
         all_label_ids = all_label_ids.numpy()
 
         preds = np.argmax(preds, axis=1)
@@ -932,14 +976,14 @@ def main():
             model.eval()
 
             preds = []
-            
+
             for input_ids, input_mask, segment_ids, label_ids in tqdm(eval_dataloader, desc="Testing"):
 
                 input_ids = input_ids.to(device)
                 input_mask = input_mask.to(device)
                 segment_ids = segment_ids.to(device)
                 label_ids = label_ids.to(device)
-                
+
                 with torch.no_grad():
                     logits = model(input_ids, segment_ids, input_mask, labels=None)
                 if len(preds) == 0:
@@ -948,7 +992,7 @@ def main():
 
                 else:
                     batch_logits = logits.detach().cpu().numpy()
-                    preds[0] = np.append(preds[0], batch_logits, axis=0)       
+                    preds[0] = np.append(preds[0], batch_logits, axis=0)
 
             preds = preds[0]
             # get the dimension corresponding to current label 1
@@ -989,15 +1033,15 @@ def main():
             eval_sampler = SequentialSampler(eval_data)
             eval_dataloader = DataLoader(eval_data, sampler=eval_sampler, batch_size=args.eval_batch_size)
             model.eval()
-            preds = []        
+            preds = []
 
             for input_ids, input_mask, segment_ids, label_ids in tqdm(eval_dataloader, desc="Testing"):
-            
+
                 input_ids = input_ids.to(device)
                 input_mask = input_mask.to(device)
                 segment_ids = segment_ids.to(device)
                 label_ids = label_ids.to(device)
-                
+
                 with torch.no_grad():
                     logits = model(input_ids, segment_ids, input_mask, labels=None)
                 if len(preds) == 0:
@@ -1006,7 +1050,7 @@ def main():
 
                 else:
                     batch_logits = logits.detach().cpu().numpy()
-                    preds[0] = np.append(preds[0], batch_logits, axis=0) 
+                    preds[0] = np.append(preds[0], batch_logits, axis=0)
 
             preds = preds[0]
             # get the dimension corresponding to current label 1
@@ -1043,7 +1087,7 @@ def main():
                 else:
                     hits[hits_level].append(0.0)
                     hits_right[hits_level].append(0.0)
-    
+
 
         for i in [0,2,9]:
             logger.info('Hits left @{0}: {1}'.format(i+1, np.mean(hits_left[i])))
@@ -1054,7 +1098,7 @@ def main():
         logger.info('Mean rank: {0}'.format(np.mean(ranks)))
         logger.info('Mean reciprocal rank left: {0}'.format(np.mean(1./np.array(ranks_left))))
         logger.info('Mean reciprocal rank right: {0}'.format(np.mean(1./np.array(ranks_right))))
-        logger.info('Mean reciprocal rank: {0}'.format(np.mean(1./np.array(ranks))))            
-              
+        logger.info('Mean reciprocal rank: {0}'.format(np.mean(1./np.array(ranks))))
+
 if __name__ == "__main__":
     main()
