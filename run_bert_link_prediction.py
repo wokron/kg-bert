@@ -473,7 +473,7 @@ def create_dataloader(features, batch_size, sampler_class):
     dataloader = DataLoader(dataset, sampler=sampler, batch_size=batch_size, collate_fn=collate_fn)
     return dataloader
 
-def convert_examples_to_features(examples, label_list, max_seq_length, tokenizer, embeddings: StackedEmbeddings, print_info = True):
+def convert_examples_to_features(examples, label_list, max_seq_length, tokenizer, print_info = True):
     """Loads a data file into a list of `InputBatch`s."""
 
     label_map = {label : i for i, label in enumerate(label_list)}
